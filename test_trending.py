@@ -83,6 +83,24 @@ class TrendingApiTests(unittest.TestCase):
         self.assertIn("api-error-banner", page)
         self.assertIn("Live GitHub data unavailable:", page)
 
+    def test_frontend_keeps_required_sort_headers_and_health_help(self):
+        page = Path("templates/index.html").read_text()
+
+        for label in ("Stars", "Open Issues", "Closed Issues", "Open PRs", "Closed PRs"):
+            self.assertIn(label, page)
+        for key in ("stars", "open_issues", "closed_issues", "open_prs", "closed_prs"):
+            self.assertIn(f'data-sort="{key}"', page)
+        self.assertIn("Healthy: fewer than 10 open issues.", page)
+        self.assertIn("Needs attention: 10 to 50 open issues.", page)
+        self.assertIn("Alert: more than 50 open issues.", page)
+        self.assertIn("/static/bg-orange-cream.jpg", page)
+        self.assertIn("floating-tooltip", page)
+        self.assertNotIn("Sorted by Stars, high to low", page)
+        self.assertNotIn("status-help", page)
+        self.assertNotIn(">Score<", page)
+        self.assertNotIn("Open iss.", page)
+        self.assertNotIn("Closed iss.", page)
+
 
 if __name__ == "__main__":
     unittest.main()
