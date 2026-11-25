@@ -1,11 +1,23 @@
 import os
-from datetime import date, datetime, timedelta
+from contextlib import closing
+from datetime import date, datetime, timedelta, timezone
 
 import requests
 from flask import Flask, jsonify, send_from_directory
 
 
+import db
+
+
 app = Flask(__name__)
+app.config["DB_PATH"] = db.DEFAULT_DB_PATH
+app.config["PERSIST_SNAPSHOTS"] = os.getenv("PERSIST_SNAPSHOTS", "1") == "1"
+
+WINDOW_DAYS = 14
+DEFAULT_LIMIT = 20
+SEARCH_PAGE_SIZE = 100
+SEARCH_RESULT_CAP = 1000
+GRAPHQL_BATCH_SIZE = 25
 
 GITHUB_REST_API = "https://api.github.com"
 GITHUB_GRAPHQL_API = "https://api.github.com/graphql"
@@ -134,18 +146,36 @@ def github_graphql(query, variables):
     return payload.get("data", {})
 
 
-def get_trending_repos():
-    since = (date.today() - timedelta(days=14)).isoformat()
-    payload = github_get(
-        "/search/repositories",
-        params={
-            "q": f"created:>{since}",
-            "sort": "stars",
-            "order": "desc",
-            "per_page": 20,
-        },
-    )
-    return payload["items"]
+def get_trending_repos(limit=DEFAULT_LIMIT, window_days=WINDOW_DAYS):
+    """Keep the higher-ranked occurrence when shifting search pages repeat an ID."""
+    limit = min(limit, SEARCH_RESULT_CAP)
+    if limit < 1 or window_days < 1:
+        raise ValueError("limit and window_days must be positive")
+    since = (date.today() - timedelta(days=window_days)).isoformat()
+    per_page = min(limit, SEARCH_PAGE_SIZE)
+    repos = []
+    seen = set()
+    for offset in range(0, SEARCH_RESULT_CAP, per_page):
+        payload = github_get(
+            "/search/repositories",
+            params={
+                "q": f"created:>{since}",
+                "sort": "stars",
+                "order": "desc",
+                "per_page": per_page,
+                "page": offset // per_page + 1,
+            },
+        )
+        items = payload["items"]
+        for repo in items[:SEARCH_RESULT_CAP - offset]:
+            if repo["id"] not in seen:
+                seen.add(repo["id"])
+                repos.append(repo)
+                if len(repos) == limit:
+                    return repos
+        if len(items) < per_page:
+            break
+    return repos
 
 
 def build_metrics_query(repos):
@@ -232,7 +262,10 @@ def get_repo_metrics(repos):
     if not missing_repos:
         return metrics_by_repo
 
-    counts_by_repo = get_bulk_repo_counts(missing_repos)
+    counts_by_repo = {}
+    for offset in range(0, len(missing_repos), GRAPHQL_BATCH_SIZE):
+        batch = missing_repos[offset:offset + GRAPHQL_BATCH_SIZE]
+        counts_by_repo.update(get_bulk_repo_counts(batch))
     for repo in missing_repos:
         repo_name = repo["full_name"]
         metrics = {
@@ -293,6 +326,26 @@ def home():
     return send_from_directory(app.template_folder, "index.html")
 
 
+def persist_snapshot(repos, metrics_by_repo, captured_at):
+    with closing(db.connect(app.config["DB_PATH"])) as conn:
+        db.init_db(conn)
+        db.save_snapshot(
+            conn, repos, metrics_by_repo, window_days=WINDOW_DAYS,
+            source="web", captured_at=captured_at,
+        )
+
+
+@app.route("/api/repos/<owner>/<name>/history")
+def repository_history(owner, name):
+    full_name = f"{owner}/{name}"
+    with closing(db.connect(app.config["DB_PATH"])) as conn:
+        db.init_db(conn)
+        snapshots = db.repo_history(conn, full_name)
+    if not snapshots:
+        return jsonify(error={"message": "No snapshots recorded for this repository."}), 404
+    return jsonify(repo=full_name, snapshots=snapshots)
+
+
 @app.route("/api/trending")
 def trending():
     cache_timestamp = TRENDING_CACHE["timestamp"]
@@ -336,6 +389,13 @@ def trending():
         raise error
 
     cache_timestamp = datetime.now()
+    if app.config["PERSIST_SNAPSHOTS"]:
+        try:
+            captured_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+            persist_snapshot(repos, metrics_by_repo, captured_at)
+        except Exception:
+            # Database failures must not hide a successful GitHub response.
+            app.logger.exception("Could not save trending snapshot")
     TRENDING_CACHE["data"] = result
     TRENDING_CACHE["timestamp"] = cache_timestamp
     return cache_payload(result, cache_timestamp)
